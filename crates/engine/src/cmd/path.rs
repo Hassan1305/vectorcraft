@@ -386,6 +386,9 @@ fn merge_coincident(sp: &mut SubPath, picked: impl Fn(usize) -> bool, join_kind:
     before - sp.anchors.len()
 }
 
+/// `path.join`: without `ids`, direct-selected anchors lying on one another merge first; else one
+/// path closes, two paths join ([`join_pair`]), and more than two join nearest ends first
+/// ([`join_nearest`]), each in one undo step.
 fn join(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "path.join";
     let join_kind = match p.get("to").and_then(Value::as_str) {
