@@ -74,7 +74,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Join",
             ["Object", "Path"],
             Some("Cmd+J"),
-            "{ids?: [path, path] (default: the selected paths), ends?: [\"first\"|\"last\", \"first\"|\"last\"] (which end of each path to join, as the Pen joins them; default: the nearest pair), to?: \"corner\"|\"smooth\" (the joined anchor: corner retracts both handles, smooth pulls handles in line with the neighbours)} join two open paths into one (the first keeps its id, selected), or close a single open path; without ids, direct-selected anchors lying on one another along a path merge into one anchor instead",
+            "{ids?: [path, path, …] (default: the selected paths), ends?: [\"first\"|\"last\", \"first\"|\"last\"] (two paths only: which end of each path to join, as the Pen joins them; default: the nearest pair), to?: \"corner\"|\"smooth\" (the joined anchor: corner retracts both handles, smooth pulls handles in line with the neighbours)} join two open paths into one (the first keeps its id, selected); more than two: the open paths whose ends are closest join first, again until one is left (closed paths among them stay as they are); or close a single open path; without ids, direct-selected anchors lying on one another along a path merge into one anchor instead",
             has_selection,
             join
         ),
@@ -462,7 +462,7 @@ fn join(s: &mut Session, p: &Value) -> Result<Value> {
                 Ok(())
             })?;
         }
-        [a, b, ..] => {
+        [a, b] => {
             let (a, b) = (*a, *b);
             if a == b {
                 return Err(bad(C, "join two different paths"));
@@ -471,65 +471,175 @@ fn join(s: &mut Session, p: &Value) -> Result<Value> {
             let picked_a = st.selection.anchors.get(&a).cloned().unwrap_or_default();
             let picked_b = st.selection.anchors.get(&b).cloned().unwrap_or_default();
             s.edit("Join", |d, sel| {
-                let pb = d.node(b).and_then(|n| n.path_data()).cloned().ok_or(EngineError::NoNode(b))?;
-                let pa = path_mut(d, a)?;
-                let (Some(sa), Some(sb)) = (pa.subpaths.iter().position(|s| !s.closed), pb.subpaths.iter().position(|s| !s.closed)) else {
-                    return Err(EngineError::Other("join needs open paths".into()));
-                };
-                let mut x = pa.subpaths[sa].clone();
-                let mut y = pb.subpaths[sb].clone();
-                let (Some((xf, xl)), Some((yf, yl))) = (end_points(&x), end_points(&y)) else {
-                    return Err(EngineError::Other("join needs open paths".into()));
-                };
-                // The ends asked for, else the closest pair.
-                let cands =
-                    [(xl.distance(yf), false, false), (xl.distance(yl), false, true), (xf.distance(yf), true, false), (xf.distance(yl), true, true)];
-                // Direct-selected end points decide which ends meet, before the closest pair does.
-                let end_of = |picked: &std::collections::BTreeSet<(usize, usize)>, si: usize, len: usize| {
-                    let last_ix = len.checked_sub(1)?;
-                    let first = picked.contains(&(si, 0));
-                    let last = picked.contains(&(si, last_ix));
-                    match (first, last) {
-                        (true, false) => Some(true),
-                        (false, true) => Some(false),
-                        _ => None,
-                    }
-                };
-                let by_selection = match (end_of(&picked_a, sa, x.anchors.len()), end_of(&picked_b, sb, y.anchors.len())) {
-                    (Some(fa), Some(fb)) => Some((fa, !fb)),
-                    _ => None,
-                };
-                let (rx, ry) = ends
-                    .or(by_selection)
-                    .unwrap_or_else(|| cands.into_iter().min_by(|p, q| p.0.total_cmp(&q.0)).map_or((false, false), |(_, rx, ry)| (rx, ry)));
-                if rx {
-                    x.reverse();
-                }
-                if ry {
-                    y.reverse();
-                }
-                let junction = x.anchors.len() - 1;
-                if let (Some(xe), Some(ys)) = (x.anchors.last().map(|a| a.p), y.anchors.first().map(|a| a.p))
-                    && xe.distance(ys) < 1e-6
-                {
-                    let first = y.anchors.remove(0);
-                    if let Some(l) = x.anchors.last_mut() {
-                        l.h_out = first.h_out;
-                    }
-                }
-                x.anchors.extend(y.anchors);
-                if let Some(smooth) = join_kind {
-                    join_point(&mut x, junction, smooth);
-                }
-                pa.subpaths[sa] = x;
-                d.remove(b)?;
+                join_pair(d, a, b, ends.or(by_selection(d, a, b, &picked_a, &picked_b)), join_kind)?;
                 sel.set([a]);
                 Ok(())
             })?;
         }
         [] => return Err(EngineError::Other("select paths to join".into())),
+        many => {
+            if ends.is_some() {
+                return Err(bad(C, "ends takes two paths"));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            if let Some(id) = many.iter().find(|id| !seen.insert(**id)) {
+                return Err(bad(C, format!("{} is listed twice", id.0)));
+            }
+            // More than two: the open paths whose ends are closest join first, again and again
+            // until one path is left (closed paths in the selection are left as they are).
+            let st = s.doc()?;
+            let mut open: Vec<(NodeId, (Point, Point))> = many.iter().filter_map(|id| Some((*id, open_ends(&st.doc, *id)?))).collect();
+            if open.len() < 2 {
+                return Err(EngineError::Other("join needs open paths".into()));
+            }
+            s.edit("Join", |d, sel| {
+                let keep = join_nearest(d, &mut open, join_kind)?;
+                sel.set([keep]);
+                Ok(())
+            })?;
+        }
     }
     ok()
+}
+
+/// The ends of `id`'s first open subpath.
+fn open_ends(d: &vectorcraft_doc::Document, id: NodeId) -> Option<(Point, Point)> {
+    d.node(id)?.path_data()?.subpaths.iter().find(|s| !s.closed).and_then(end_points)
+}
+
+/// How far apart the nearest ends of two paths are.
+fn end_gap((xf, xl): (Point, Point), (yf, yl): (Point, Point)) -> f64 {
+    xl.distance(yf).min(xl.distance(yl)).min(xf.distance(yf)).min(xf.distance(yl))
+}
+
+/// Join `paths` (open paths and their ends) into one: the pair whose ends are closest first,
+/// repeated until one is left, as the [Join command](https://helpx.adobe.com/illustrator/desktop/draw-shapes-and-paths/modify-paths/connect-and-join-paths.html)
+/// does with more than two paths. Of each pair the one listed first keeps its id. Each path's
+/// nearest other path is kept, and only redone for the paths a join touches. Returns the path left.
+fn join_nearest(d: &mut vectorcraft_doc::Document, paths: &mut [(NodeId, (Point, Point))], join_kind: Option<bool>) -> Result<NodeId> {
+    let n = paths.len();
+    let mut alive = vec![true; n];
+    let nearest_of = |paths: &[(NodeId, (Point, Point))], alive: &[bool], i: usize| -> (f64, usize) {
+        let ends = paths.get(i).map(|p| p.1);
+        let mut best = (f64::INFINITY, i);
+        for (j, (_, e)) in paths.iter().enumerate() {
+            if j != i
+                && alive.get(j).copied().unwrap_or(false)
+                && let Some(ends) = ends
+            {
+                let g = end_gap(ends, *e);
+                if g < best.0 {
+                    best = (g, j);
+                }
+            }
+        }
+        best
+    };
+    let mut nearest: Vec<(f64, usize)> = (0..n).map(|i| nearest_of(paths, &alive, i)).collect();
+    for _ in 1..n {
+        let Some((i, &(_, j))) =
+            nearest.iter().enumerate().filter(|(i, _)| alive.get(*i).copied().unwrap_or(false)).min_by(|p, q| p.1.0.total_cmp(&q.1.0))
+        else {
+            break;
+        };
+        let (keep, drop) = (i.min(j), i.max(j));
+        let (Some(&(a, _)), Some(&(b, _))) = (paths.get(keep), paths.get(drop)) else { break };
+        join_pair(d, a, b, None, join_kind)?;
+        if let Some(f) = alive.get_mut(drop) {
+            *f = false;
+        }
+        let ends = open_ends(d, a).ok_or_else(|| EngineError::Other("join needs open paths".into()))?;
+        if let Some(p) = paths.get_mut(keep) {
+            p.1 = ends;
+        }
+        for k in 0..n {
+            if k == keep || !alive.get(k).copied().unwrap_or(false) {
+                continue;
+            }
+            let (g, to) = nearest.get(k).copied().unwrap_or((f64::INFINITY, k));
+            let redo = to == keep || to == drop;
+            let gap = paths.get(k).map_or(f64::INFINITY, |p| end_gap(p.1, ends));
+            if let Some(slot) = nearest.get_mut(k) {
+                if redo {
+                    *slot = nearest_of(paths, &alive, k);
+                } else if gap < g {
+                    *slot = (gap, keep);
+                }
+            }
+        }
+        if let Some(slot) = nearest.get_mut(keep) {
+            *slot = nearest_of(paths, &alive, keep);
+        }
+    }
+    alive.iter().position(|a| *a).and_then(|i| paths.get(i)).map(|p| p.0).ok_or_else(|| EngineError::Other("select paths to join".into()))
+}
+
+/// Which ends of `a` and `b` meet when the direct selection picked one end point of each, as
+/// (reverse `a`, reverse `b`).
+fn by_selection(
+    d: &vectorcraft_doc::Document,
+    a: NodeId,
+    b: NodeId,
+    picked_a: &std::collections::BTreeSet<(usize, usize)>,
+    picked_b: &std::collections::BTreeSet<(usize, usize)>,
+) -> Option<(bool, bool)> {
+    let open = |id: NodeId| {
+        let pd = d.node(id)?.path_data()?;
+        let si = pd.subpaths.iter().position(|s| !s.closed)?;
+        Some((si, pd.subpaths.get(si)?.anchors.len()))
+    };
+    let end_of = |picked: &std::collections::BTreeSet<(usize, usize)>, (si, len): (usize, usize)| {
+        let last_ix = len.checked_sub(1)?;
+        match (picked.contains(&(si, 0)), picked.contains(&(si, last_ix))) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    };
+    Some((end_of(picked_a, open(a)?)?, !end_of(picked_b, open(b)?)?))
+}
+
+/// Join open path `b` onto open path `a` (their first open subpaths), which keeps its id; `b` is
+/// removed. `ends`: (reverse `a`, reverse `b`), so `a`'s end comes last and `b`'s first; `None`
+/// for the closest pair.
+fn join_pair(d: &mut vectorcraft_doc::Document, a: NodeId, b: NodeId, ends: Option<(bool, bool)>, join_kind: Option<bool>) -> Result<()> {
+    let pb = d.node(b).and_then(|n| n.path_data()).cloned().ok_or(EngineError::NoNode(b))?;
+    let pa = path_mut(d, a)?;
+    let (Some(sa), Some(sb)) = (pa.subpaths.iter().position(|s| !s.closed), pb.subpaths.iter().position(|s| !s.closed)) else {
+        return Err(EngineError::Other("join needs open paths".into()));
+    };
+    let (Some(mut x), Some(mut y)) = (pa.subpaths.get(sa).cloned(), pb.subpaths.get(sb).cloned()) else {
+        return Err(EngineError::Other("join needs open paths".into()));
+    };
+    let (Some((xf, xl)), Some((yf, yl))) = (end_points(&x), end_points(&y)) else {
+        return Err(EngineError::Other("join needs open paths".into()));
+    };
+    let cands = [(xl.distance(yf), false, false), (xl.distance(yl), false, true), (xf.distance(yf), true, false), (xf.distance(yl), true, true)];
+    let (rx, ry) = ends.unwrap_or_else(|| cands.into_iter().min_by(|p, q| p.0.total_cmp(&q.0)).map_or((false, false), |(_, rx, ry)| (rx, ry)));
+    if rx {
+        x.reverse();
+    }
+    if ry {
+        y.reverse();
+    }
+    let junction = x.anchors.len().saturating_sub(1);
+    if let (Some(xe), Some(ys)) = (x.anchors.last().map(|a| a.p), y.anchors.first().map(|a| a.p))
+        && xe.distance(ys) < 1e-6
+    {
+        let first = y.anchors.remove(0);
+        if let Some(l) = x.anchors.last_mut() {
+            l.h_out = first.h_out;
+        }
+    }
+    x.anchors.extend(y.anchors);
+    if let Some(smooth) = join_kind {
+        join_point(&mut x, junction, smooth);
+    }
+    if let Some(slot) = pa.subpaths.get_mut(sa) {
+        *slot = x;
+    }
+    d.remove(b)?;
+    Ok(())
 }
 
 pub(super) type AnchorTargets = Vec<(NodeId, Vec<(usize, usize)>)>;

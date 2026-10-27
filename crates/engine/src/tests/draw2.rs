@@ -2400,6 +2400,60 @@ fn join_takes_the_paths_and_the_ends_to_join() {
     }
 }
 
+/// #4156: with more than two paths selected, one Join joins them all, the ends closest to each
+/// other first, in one undo step; a closed path among them is left as it is.
+#[test]
+fn join_joins_every_selected_open_path_at_once() {
+    let mut s = session();
+    // A triangle's three sides, each drawn on its own.
+    let a = line(&mut s, 0.0, 0.0, 100.0, 0.0);
+    let b = line(&mut s, 50.0, 80.0, 100.0, 0.0);
+    let c = line(&mut s, 0.0, 0.0, 50.0, 80.0);
+    let r = rect(&mut s, 300.0, 300.0, 10.0, 10.0);
+    s.execute("select.all", &json!({})).unwrap();
+    s.execute("path.join", &json!({})).unwrap();
+    let left: Vec<NodeId> = paths(&s).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(left.len(), 2, "one joined path and the rectangle");
+    assert!(left.contains(&r) && path(&s, r).subpaths[0].closed, "the closed rectangle is untouched");
+    let joined = *left.iter().find(|id| **id != r).unwrap();
+    assert!([a, b, c].contains(&joined));
+    let mut pts: Vec<(f64, f64)> = path(&s, joined).subpaths[0].anchors.iter().map(|x| (x.p.x, x.p.y)).collect();
+    assert_eq!(pts.len(), 4, "the shared corners merge: {pts:?}");
+    assert_eq!(pts.first(), pts.last(), "the sides run all the way round");
+    pts.pop();
+    pts.sort_by(|p, q| p.partial_cmp(q).unwrap());
+    assert_eq!(pts, [(0.0, 0.0), (50.0, 80.0), (100.0, 0.0)]);
+    assert_eq!(s.doc().unwrap().selection.objects, [joined]);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(paths(&s).len(), 4, "one undo step");
+
+    // Many segments of one polyline, drawn out of order, join into it in one go.
+    let mut s = session();
+    let n = 200;
+    let mut order: Vec<usize> = (0..n).collect();
+    // A fixed shuffle: every 7th step through the indices (7 and 200 are coprime).
+    order = (0..n).map(|k| order[(k * 7) % n]).collect();
+    for i in order {
+        let x = i as f64 * 10.0;
+        let y = if i % 2 == 0 { 0.0 } else { 5.0 };
+        let y2 = if i % 2 == 0 { 5.0 } else { 0.0 };
+        line(&mut s, x, y, x + 10.0, y2);
+    }
+    s.execute("select.all", &json!({})).unwrap();
+    s.execute("path.join", &json!({})).unwrap();
+    let left: Vec<NodeId> = paths(&s).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(left.len(), 1);
+    let xs: Vec<f64> = path(&s, left[0]).subpaths[0].anchors.iter().map(|x| x.p.x).collect();
+    assert_eq!(xs.len(), n + 1);
+    assert!(xs.windows(2).all(|w| w[1] > w[0]) || xs.windows(2).all(|w| w[1] < w[0]), "in order along the line");
+
+    // `ends` names two paths only.
+    let mut s = session();
+    let ids: Vec<u64> = (0..3).map(|i| line(&mut s, i as f64 * 20.0, 0.0, i as f64 * 20.0 + 10.0, 0.0).0).collect();
+    assert!(s.execute("path.join", &json!({"ids": ids, "ends": ["first", "last"]})).is_err());
+    assert!(s.execute("path.join", &json!({"ids": [ids[0], ids[1], ids[0]]})).is_err(), "a path listed twice");
+}
+
 /// Without `ends`, the end points picked with the direct selection are the ones joined.
 #[test]
 fn join_uses_the_selected_end_points() {
